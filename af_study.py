@@ -88,6 +88,7 @@ ensure_deps()
 
 import numpy as np  # noqa: E402
 import requests  # noqa: E402
+from Bio.Align import PairwiseAligner  # noqa: E402
 from Bio.PDB import MMCIFParser  # noqa: E402
 from scipy.stats import mannwhitneyu, spearmanr, kruskal  # noqa: E402
 from tmtools import tm_align  # noqa: E402
@@ -139,6 +140,11 @@ CONFIG = {
 
     "figure_dpi": 150,
 }
+
+# A protein is treated as a fragment mismatch (not a real prediction failure)
+# when less than this fraction of its experimental sequence is present in the
+# AlphaFold model. Tune here.
+COVERAGE_MIN = 0.80
 
 
 # Built-in fallback registry, used only when proteins.csv is absent.
@@ -383,10 +389,44 @@ def disorder_bin(disorder_pct):
     return "75-100"
 
 
+# Aligner used only to measure sequence coverage. Match-only scoring with free
+# end gaps so a short crystallised domain can align inside a long AlphaFold
+# model without paying for the overhang.
+_COVERAGE_ALIGNER = PairwiseAligner()
+_COVERAGE_ALIGNER.mode = "global"
+_COVERAGE_ALIGNER.match_score = 1.0
+_COVERAGE_ALIGNER.mismatch_score = 0.0
+_COVERAGE_ALIGNER.open_gap_score = -10.0
+_COVERAGE_ALIGNER.extend_gap_score = -0.5
+_COVERAGE_ALIGNER.end_gap_score = 0.0
+
+
+def sequence_coverage(exp_seq, af_seq):
+    """Fraction of the experimental sequence present in the AlphaFold model.
+
+    Globally aligns the experimental chain sequence to the AlphaFold model
+    sequence and returns (residues aligned to an identical AlphaFold residue) /
+    (length of the experimental sequence). Low coverage means the model (often a
+    polyprotein fragment) does not contain the crystallised region, so a low
+    TM-score is a fragment-mismatch artifact rather than a real prediction
+    failure. Returns None if it cannot be computed.
+    """
+    if not exp_seq or not af_seq:
+        return None
+    try:
+        alignment = _COVERAGE_ALIGNER.align(exp_seq, af_seq)[0]
+        identical = alignment.counts().identities
+        return identical / len(exp_seq)
+    except Exception as exc:
+        print("  coverage computation failed: {0}".format(exc))
+        return None
+
+
 METRIC_FIELDS = [
     "name", "type", "pdb_id", "pdb_chain", "uniprot",
     "exp_len", "af_len", "tm_score", "rmsd", "mean_plddt",
-    "disorder_frac", "disorder_pct", "disorder_bin", "missing_frac", "status",
+    "disorder_frac", "disorder_pct", "disorder_bin", "missing_frac",
+    "coverage", "fragment_flag", "status",
 ]
 
 
@@ -404,7 +444,8 @@ def stage2_metrics(registry):
             "uniprot": protein["uniprot"],
             "exp_len": None, "af_len": None, "tm_score": None, "rmsd": None,
             "mean_plddt": None, "disorder_frac": None, "disorder_pct": None,
-            "disorder_bin": "NA", "missing_frac": None, "status": "ok",
+            "disorder_bin": "NA", "missing_frac": None,
+            "coverage": None, "fragment_flag": False, "status": "ok",
         }
         try:
             exp_path = local_structure_path(experimental_prefix(protein["pdb_id"]))
@@ -431,6 +472,10 @@ def stage2_metrics(registry):
             row["mean_plddt"] = mean_plddt(af_chain)
             row["missing_frac"] = missing_fraction(exp_chain)
 
+            coverage = sequence_coverage(exp_seq, af_seq)
+            row["coverage"] = coverage
+            row["fragment_flag"] = coverage is not None and coverage < COVERAGE_MIN
+
             disorder = compute_disorder(af_seq)
             if disorder is not None:
                 row["disorder_frac"] = disorder
@@ -441,10 +486,11 @@ def stage2_metrics(registry):
             print("  {0}: {1}".format(protein["name"], row["status"]))
 
         if row["status"] == "ok":
-            print("  {0:<32} TM={1} RMSD={2} pLDDT={3} disorder={4}".format(
+            print("  {0:<32} TM={1} RMSD={2} pLDDT={3} disorder={4} cov={5}{6}".format(
                 protein["name"][:32], _fmt(row["tm_score"], 3),
                 _fmt(row["rmsd"], 2), _fmt(row["mean_plddt"], 1),
-                _fmt(row["disorder_pct"], 1)))
+                _fmt(row["disorder_pct"], 1), _fmt(row["coverage"], 2),
+                "  [FRAGMENT]" if row["fragment_flag"] else ""))
         rows.append(row)
 
     out = os.path.join(CONFIG["results_dir"], "metrics.csv")
@@ -484,23 +530,11 @@ def rank_biserial(u_statistic, n1, n2):
     return 2.0 * u_statistic / (n1 * n2) - 1.0
 
 
-def stage3_stats(rows):
-    """Run exploratory statistics, print them, and write results/stats.txt."""
-    print("\n=== Stage 3: statistics ===")
-    lines = []
-
-    def emit(text=""):
-        print(text)
-        lines.append(text)
-
-    ok = [r for r in rows if r["status"] == "ok" and r["tm_score"] is not None]
+def _stats_block(ok, emit):
+    """Emit the full set of statistics for one set of usable rows."""
     viral = [r for r in ok if r["type"] == "viral"]
     cellular = [r for r in ok if r["type"] == "cellular"]
 
-    emit("AlphaFold accuracy: viral vs cellular proteins")
-    emit("Exploratory analysis. Effect sizes are reported alongside p-values;")
-    emit("p-values are descriptive given the small, convenience-based sample.")
-    emit("")
     emit("Usable proteins: {0} total ({1} viral, {2} cellular)".format(
         len(ok), len(viral), len(cellular)))
     emit("")
@@ -577,6 +611,46 @@ def stage3_stats(rows):
         emit("  to populate the disorder bins before interpreting this test.")
     emit("")
 
+
+def stage3_stats(rows):
+    """Run the statistics on all proteins and on the coverage-filtered set.
+
+    The coverage-filtered block excludes fragment-mismatch artifacts (a small
+    crystallised domain compared against an AlphaFold model, often a polyprotein
+    fragment, that does not contain it), which is what separates real AlphaFold
+    prediction errors from a sequence mismatch.
+    """
+    print("\n=== Stage 3: statistics ===")
+    lines = []
+
+    def emit(text=""):
+        print(text)
+        lines.append(text)
+
+    ok = [r for r in rows if r["status"] == "ok" and r["tm_score"] is not None]
+    kept = [r for r in ok if not r["fragment_flag"]]
+    dropped = [r for r in ok if r["fragment_flag"]]
+
+    emit("AlphaFold accuracy: viral vs cellular proteins")
+    emit("Exploratory analysis. Effect sizes are reported alongside p-values;")
+    emit("p-values are descriptive given the small, convenience-based sample.")
+    emit("")
+
+    emit("=" * 60)
+    emit("ALL PROTEINS")
+    emit("=" * 60)
+    _stats_block(ok, emit)
+
+    emit("=" * 60)
+    emit("COVERAGE-FILTERED (coverage >= {0:.2f})".format(COVERAGE_MIN))
+    emit("=" * 60)
+    _stats_block(kept, emit)
+
+    dropped_viral = sum(1 for r in dropped if r["type"] == "viral")
+    dropped_cellular = sum(1 for r in dropped if r["type"] == "cellular")
+    emit("dropped {0} ({1} viral, {2} cellular) as fragment mismatches".format(
+        len(dropped), dropped_viral, dropped_cellular))
+
     out = os.path.join(CONFIG["results_dir"], "stats.txt")
     with open(out, "w") as handle:
         handle.write("\n".join(lines) + "\n")
@@ -587,23 +661,55 @@ def stage3_stats(rows):
 # Stage 4: figures.
 # ---------------------------------------------------------------------------
 def stage4_figures(rows):
-    """Render three PNG figures into the results directory."""
+    """Render three PNG figures from the coverage-filtered set.
+
+    The boxplot uses only kept proteins. The scatter plots also show the
+    fragment-flagged proteins, drawn with an 'x' marker so the outliers stay
+    visible but are clearly distinguishable from the kept set.
+    """
     print("\n=== Stage 4: figures ===")
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     os.makedirs(CONFIG["results_dir"], exist_ok=True)
     dpi = CONFIG["figure_dpi"]
     colors = {"viral": "#d1495b", "cellular": "#30638e"}
 
     ok = [r for r in rows if r["status"] == "ok" and r["tm_score"] is not None]
-    viral = [r for r in ok if r["type"] == "viral"]
-    cellular = [r for r in ok if r["type"] == "cellular"]
+    kept = [r for r in ok if not r["fragment_flag"]]
+    flagged = [r for r in ok if r["fragment_flag"]]
+    groups = [("viral", [r for r in kept if r["type"] == "viral"]),
+              ("cellular", [r for r in kept if r["type"] == "cellular"])]
 
-    # Figure 1: TM-score boxplot with jittered points.
+    def scatter_with_flags(ax, field, xlabel, title):
+        """Scatter field vs TM-score: kept as circles, flagged as x markers."""
+        for name, grp in groups:
+            xs = [r[field] for r in grp if r[field] is not None]
+            ys = [r["tm_score"] for r in grp if r[field] is not None]
+            ax.scatter(xs, ys, color=colors[name], alpha=0.8, label=name,
+                       edgecolor="white", linewidth=0.5)
+        for r in flagged:
+            if r[field] is not None:
+                ax.scatter(r[field], r["tm_score"], color=colors[r["type"]],
+                           marker="x", s=55, linewidth=1.6, zorder=3)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("TM-score")
+        ax.set_title(title + " (coverage-filtered)")
+        handles = [
+            Line2D([], [], marker="o", linestyle="none", markerfacecolor=colors["viral"],
+                   markeredgecolor="white", color="w", label="viral"),
+            Line2D([], [], marker="o", linestyle="none", markerfacecolor=colors["cellular"],
+                   markeredgecolor="white", color="w", label="cellular"),
+        ]
+        if flagged:
+            handles.append(Line2D([], [], marker="x", linestyle="none", color="gray",
+                                  label="fragment-flagged"))
+        ax.legend(handles=handles)
+
+    # Figure 1: TM-score boxplot with jittered points (kept set only).
     fig, ax = plt.subplots(figsize=(6, 5))
-    groups = [("viral", viral), ("cellular", cellular)]
     box_data = [[r["tm_score"] for r in grp] for _, grp in groups]
     positions = [1, 2]
     if any(box_data):
@@ -618,40 +724,22 @@ def stage4_figures(rows):
     ax.set_xticks(positions)
     ax.set_xticklabels(["viral", "cellular"])
     ax.set_ylabel("TM-score (AF vs experimental)")
-    ax.set_title("AlphaFold accuracy: viral vs cellular")
+    ax.set_title("AlphaFold accuracy: viral vs cellular (coverage-filtered)")
     fig.tight_layout()
     fig.savefig(os.path.join(CONFIG["results_dir"], "tm_boxplot.png"), dpi=dpi)
     plt.close(fig)
 
-    # Figure 2: pLDDT vs TM-score scatter coloured by type.
+    # Figure 2: pLDDT vs TM-score scatter.
     fig, ax = plt.subplots(figsize=(6, 5))
-    for name, grp in groups:
-        xs = [r["mean_plddt"] for r in grp if r["mean_plddt"] is not None]
-        ys = [r["tm_score"] for r in grp if r["mean_plddt"] is not None]
-        ax.scatter(xs, ys, color=colors[name], alpha=0.8, label=name,
-                   edgecolor="white", linewidth=0.5)
-    ax.set_xlabel("mean pLDDT")
-    ax.set_ylabel("TM-score")
-    ax.set_title("pLDDT vs TM-score")
-    ax.legend()
+    scatter_with_flags(ax, "mean_plddt", "mean pLDDT", "pLDDT vs TM-score")
     fig.tight_layout()
     fig.savefig(os.path.join(CONFIG["results_dir"], "plddt_vs_tm.png"), dpi=dpi)
     plt.close(fig)
 
-    # Figure 3: disorder% vs TM-score scatter coloured by type.
+    # Figure 3: disorder% vs TM-score scatter.
     fig, ax = plt.subplots(figsize=(6, 5))
-    any_disorder = False
-    for name, grp in groups:
-        xs = [r["disorder_pct"] for r in grp if r["disorder_pct"] is not None]
-        ys = [r["tm_score"] for r in grp if r["disorder_pct"] is not None]
-        if xs:
-            any_disorder = True
-        ax.scatter(xs, ys, color=colors[name], alpha=0.8, label=name,
-                   edgecolor="white", linewidth=0.5)
-    ax.set_xlabel("predicted disorder (%)")
-    ax.set_ylabel("TM-score")
-    ax.set_title("Disorder vs TM-score")
-    ax.legend()
+    any_disorder = any(r["disorder_pct"] is not None for r in ok)
+    scatter_with_flags(ax, "disorder_pct", "predicted disorder (%)", "Disorder vs TM-score")
     if not any_disorder:
         ax.text(0.5, 0.5, "disorder unavailable (metapredict not installed)",
                 ha="center", va="center", transform=ax.transAxes)
