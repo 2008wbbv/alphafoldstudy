@@ -47,6 +47,7 @@ def ensure_deps():
         "matplotlib": "matplotlib",
         "Bio": "biopython",
         "tmtools": "tmtools",
+        "statsmodels": "statsmodels",
     }
     optional = {
         "metapredict": "metapredict",
@@ -752,6 +753,129 @@ def stage4_figures(rows):
 
 
 # ---------------------------------------------------------------------------
+# Stage 5: multiple regression.
+# ---------------------------------------------------------------------------
+def stage5_regression(rows):
+    """Test whether viral origin predicts accuracy once disorder and coverage
+    are controlled for, on the coverage-filtered set.
+
+    Fits tm_score ~ disorder_pred + coverage + is_viral with OLS. If is_viral
+    loses significance while disorder_pred keeps it, disorder is doing the work
+    and "viral" was largely a proxy.
+    """
+    print("\n=== Stage 5: multiple regression ===")
+    try:
+        import pandas as pd
+        import statsmodels.formula.api as smf
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+        from patsy import dmatrices
+    except Exception as exc:
+        print("  statsmodels unavailable, skipping regression: {0}".format(exc))
+        return
+
+    lines = []
+
+    def emit(text=""):
+        print(text)
+        lines.append(text)
+
+    formula = "tm_score ~ disorder_pred + coverage + is_viral"
+
+    # Build the regression dataset from the coverage-filtered rows, dropping any
+    # row missing one of the four modelled columns.
+    records = []
+    for r in rows:
+        if r["status"] != "ok" or r["fragment_flag"]:
+            continue
+        tm = r["tm_score"]
+        disorder_pred = r["disorder_frac"]
+        coverage = r["coverage"]
+        if tm is None or disorder_pred is None or coverage is None:
+            continue
+        records.append({
+            "tm_score": tm,
+            "disorder_pred": disorder_pred,
+            "coverage": coverage,
+            "is_viral": 1 if r["type"] == "viral" else 0,
+        })
+
+    n = len(records)
+    emit("Multiple regression on the coverage-filtered set")
+    emit("Model: {0}".format(formula))
+    emit("Question: does viral origin still predict AlphaFold accuracy once")
+    emit("disorder and coverage are controlled for?")
+    emit("")
+    emit("Sample size used (after dropping missing rows): n = {0}".format(n))
+    if n < 20:
+        emit("WARNING: n < 20, this regression is underpowered and should be")
+        emit("treated as exploratory.")
+    emit("")
+
+    out = os.path.join(CONFIG["results_dir"], "regression.txt")
+    if n < 5:
+        emit("Not enough data to fit the model (need at least 5 rows).")
+        with open(out, "w") as handle:
+            handle.write("\n".join(lines) + "\n")
+        print("  Wrote regression to {0}.".format(out))
+        return
+
+    predictors = ["disorder_pred", "coverage", "is_viral"]
+    try:
+        df = pd.DataFrame(records)
+        full = smf.ols(formula, data=df).fit()
+        disorder_only = smf.ols("tm_score ~ disorder_pred", data=df).fit()
+
+        emit("Full model coefficients:")
+        significance = {}
+        for name in predictors:
+            coef = full.params[name]
+            p_value = full.pvalues[name]
+            is_sig = p_value < 0.05
+            significance[name] = is_sig
+            emit("  {0:14} coef = {1:+.4f}, p = {2:.4g} -> {3}".format(
+                name, coef, p_value,
+                "significant at 0.05" if is_sig else "not significant at 0.05"))
+        emit("")
+
+        p_viral = full.pvalues["is_viral"]
+        if significance["is_viral"]:
+            emit("CORE ANSWER: is_viral REMAINS significant (p = {0:.4g}) after".format(p_viral))
+            emit("controlling for disorder and coverage; viral origin carries")
+            emit("predictive value of its own.")
+        else:
+            emit("CORE ANSWER: is_viral is NOT significant (p = {0:.4g}) after".format(p_viral))
+            emit("controlling for disorder and coverage; the viral vs cellular gap")
+            emit("is accounted for by disorder and coverage.")
+        emit("")
+
+        emit("Variance explained (R-squared):")
+        emit("  disorder-only model  = {0:.4f}".format(disorder_only.rsquared))
+        emit("  full model           = {0:.4f}".format(full.rsquared))
+        emit("")
+
+        emit("Variance inflation factors (multicollinearity, flag if > 5):")
+        _, design = dmatrices(formula, data=df, return_type="dataframe")
+        for i, name in enumerate(design.columns):
+            if name == "Intercept":
+                continue
+            vif = variance_inflation_factor(design.values, i)
+            flag = "  <-- HIGH (> 5)" if vif > 5 else ""
+            emit("  {0:14} VIF = {1:.3f}{2}".format(name, vif, flag))
+        emit("")
+
+        with open(out, "w") as handle:
+            handle.write(str(full.summary()))
+            handle.write("\n\n")
+            handle.write("\n".join(lines))
+            handle.write("\n")
+    except Exception as exc:
+        emit("Regression failed: {0}".format(exc))
+        with open(out, "w") as handle:
+            handle.write("\n".join(lines) + "\n")
+    print("  Wrote regression to {0}.".format(out))
+
+
+# ---------------------------------------------------------------------------
 # Main.
 # ---------------------------------------------------------------------------
 def main():
@@ -761,7 +885,8 @@ def main():
     rows = stage2_metrics(registry)
     stage3_stats(rows)
     stage4_figures(rows)
-    print("\nDone. See {0} for metrics.csv, stats.txt and figures.".format(
+    stage5_regression(rows)
+    print("\nDone. See {0} for metrics.csv, stats.txt, regression.txt and figures.".format(
         CONFIG["results_dir"]))
 
 
