@@ -13,10 +13,15 @@ accessions and avoids the selection bias that creeps in when a human picks
 Pipeline per group (viral, cellular):
   1. Run an RCSB structured search (taxonomy + protein + resolution).
   2. For each returned polymer-entity ID (for example "6LU7_1"), resolve
-     details through the REST data API.
+     details, including the sequence, through the REST data API.
   3. Keep one representative per UniProt accession, inside a length window.
-  4. Confirm an AlphaFold model exists before accepting the protein.
-  5. Stop at the per-group cap.
+  4. Confirm an AlphaFold model exists before accepting the candidate.
+
+Then, across both groups, estimate disorder for every candidate with
+metapredict and select proteins to deliberately populate all four disorder
+bins as evenly as the available data allows, keeping the viral/cellular
+balance within each bin as close to even as possible. A balance table is
+printed so the make-up of the final set is visible.
 
 All tunables live in the CONFIG dict at the top of the file.
 
@@ -34,41 +39,65 @@ import time
 # Dependency bootstrap: install on first run, fall back to system override.
 # ---------------------------------------------------------------------------
 def ensure_deps():
-    """Make sure third-party imports are available, installing if needed.
+    """Install third-party packages if missing.
 
-    Mapping is import-name -> pip-name. A plain "pip install" is tried first;
-    if that is rejected (for example on an externally managed interpreter) we
-    retry with --break-system-packages.
+    Core packages are mandatory. metapredict is optional: without it the
+    disorder-balanced selection degrades to a simple first-N selection rather
+    than failing the run.
     """
-    required = {
+    core = {
         "requests": "requests",
         "rcsbapi": "rcsb-api",
     }
+    optional = {
+        "metapredict": "metapredict",
+    }
+
+    def pip_install(pip_names):
+        base = [sys.executable, "-m", "pip", "install", "--quiet"]
+        try:
+            subprocess.check_call(base + pip_names)
+        except subprocess.CalledProcessError:
+            print("Standard install failed, retrying with --break-system-packages")
+            subprocess.check_call(base + ["--break-system-packages"] + pip_names)
+
     missing = {}
-    for import_name, pip_name in required.items():
+    for import_name, pip_name in core.items():
         try:
             importlib.import_module(import_name)
         except ImportError:
             missing[import_name] = pip_name
+    if missing:
+        pip_names = sorted(set(missing.values()))
+        print("Installing core dependencies: " + ", ".join(pip_names))
+        pip_install(pip_names)
+        importlib.invalidate_caches()
 
-    if not missing:
-        return
-
-    pip_names = sorted(set(missing.values()))
-    print("Installing missing dependencies: " + ", ".join(pip_names))
-    base = [sys.executable, "-m", "pip", "install", "--quiet"]
-    try:
-        subprocess.check_call(base + pip_names)
-    except subprocess.CalledProcessError:
-        print("Standard install failed, retrying with --break-system-packages")
-        subprocess.check_call(base + ["--break-system-packages"] + pip_names)
-    importlib.invalidate_caches()
+    for import_name, pip_name in optional.items():
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            print("Installing optional dependency: " + pip_name)
+            try:
+                pip_install([pip_name])
+                importlib.invalidate_caches()
+            except Exception as exc:
+                print("Optional dependency {0} unavailable: {1}".format(pip_name, exc))
 
 
 ensure_deps()
 
 import requests  # noqa: E402
 from rcsbapi.search import AttributeQuery  # noqa: E402
+
+try:
+    import metapredict as _metapredict  # noqa: E402
+    METAPREDICT_OK = True
+except Exception as _exc:  # pragma: no cover - environment dependent
+    _metapredict = None
+    METAPREDICT_OK = False
+    print("metapredict unavailable, disorder-balanced selection will fall back "
+          "to first-N: {0}".format(_exc))
 
 
 # ---------------------------------------------------------------------------
@@ -89,15 +118,20 @@ CONFIG = {
     "min_length": 50,
     "max_length": 600,
 
-    # How many distinct proteins to keep per group, and how many raw search
-    # hits to examine before giving up on reaching that cap. pool_size bounds
-    # the number of REST round-trips so a run finishes in reasonable time.
-    # Note: distinct viral proteins are sparser near the front of the search
-    # order (a few heavily-deposited proteins dominate and collapse under the
-    # per-accession dedup), so filling the viral cap can need a larger pool than
-    # the cellular cap. Raise pool_size if the viral group comes up short.
-    "per_group_cap": 30,
-    "pool_size": 600,
+    # Target size of the whole registry. The per-group and pool sizes are
+    # raised in step with it: per_group_cap bounds how many viable candidates
+    # are gathered per group (which bounds the disorder predictions), and
+    # pool_size bounds how many raw search hits are examined per group. Distinct
+    # viral proteins (and disordered crystallised proteins of either type) are
+    # sparse, so the high-disorder bins usually fill less than the target; raise
+    # pool_size and per_group_cap to push further into the search if needed.
+    "target_total": 300,
+    "per_group_cap": 150,
+    "pool_size": 800,
+
+    # A residue counts as disordered when its metapredict score is at or above
+    # this threshold; the disorder fraction is binned into four quartile bins.
+    "disorder_threshold": 0.5,
 
     # AlphaFold model file versions to probe, in order. v4 is the version named
     # in the original study brief; the AlphaFold DB has since advanced, so the
@@ -123,6 +157,9 @@ CONFIG = {
 
     "output_csv": "proteins.csv",
 }
+
+DISORDER_BINS = ["0-25", "25-50", "50-75", "75-100"]
+GROUP_TYPES = ["viral", "cellular"]
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +191,9 @@ def build_query(taxonomy_id):
 def resolve_entity(entity_id):
     """Resolve an entity ID such as "6LU7_1" to a detail dict, or None.
 
-    Returns a dict with keys: pdb_id, pdb_chain, uniprot, name, length.
-    Returns None when the entity has no UniProt mapping or the lookup fails.
+    Returns a dict with keys: pdb_id, pdb_chain, uniprot, name, length,
+    sequence. Returns None when the entity has no UniProt mapping, no sequence,
+    or the lookup fails.
     """
     if "_" not in entity_id:
         return None
@@ -177,6 +215,8 @@ def resolve_entity(entity_id):
 
     entity_poly = data.get("entity_poly", {}) or {}
     poly_entity = data.get("rcsb_polymer_entity", {}) or {}
+    sequence = (entity_poly.get("pdbx_seq_one_letter_code_can")
+                or entity_poly.get("pdbx_seq_one_letter_code") or "")
 
     return {
         "pdb_id": pdb.upper(),
@@ -184,6 +224,7 @@ def resolve_entity(entity_id):
         "uniprot": uniprot_ids[0],
         "name": poly_entity.get("pdbx_description") or "Unknown",
         "length": entity_poly.get("rcsb_sample_sequence_length"),
+        "sequence": sequence.strip().upper(),
     }
 
 
@@ -219,18 +260,20 @@ def af_model_exists(uniprot):
 
 
 # ---------------------------------------------------------------------------
-# Select one group.
+# Gather viable candidates for one group.
 # ---------------------------------------------------------------------------
-def select_group(type_label, taxonomy_id):
-    """Select up to per_group_cap proteins for a single group.
+def gather_candidates(type_label, taxonomy_id):
+    """Gather viable candidates for one group (no disorder binning yet).
 
-    Always returns whatever was gathered, even if the search raises partway
-    through, so a drifted attribute name produces partial results rather than
-    a silent failure.
+    A candidate is viable when it passes the same filters as before: one
+    representative per UniProt accession, inside the length window, with an
+    AlphaFold model. Gathering stops at per_group_cap viable candidates or
+    pool_size examined entities, whichever comes first. Returns whatever was
+    gathered even if the search raises partway through.
     """
-    print("\n=== Selecting {0} proteins (taxonomy {1}) ===".format(
+    print("\n=== Gathering {0} candidates (taxonomy {1}) ===".format(
         type_label, taxonomy_id))
-    selected = []
+    candidates = []
     seen_uniprot = set()
 
     try:
@@ -239,7 +282,7 @@ def select_group(type_label, taxonomy_id):
 
         examined = 0
         for entity_id in results:
-            if len(selected) >= CONFIG["per_group_cap"]:
+            if len(candidates) >= CONFIG["per_group_cap"]:
                 break
             if examined >= CONFIG["pool_size"]:
                 break
@@ -257,31 +300,167 @@ def select_group(type_label, taxonomy_id):
             length = details["length"]
             if length is None or length < CONFIG["min_length"] or length > CONFIG["max_length"]:
                 continue
+            if not details["sequence"]:
+                continue
 
             version = af_model_exists(uniprot)
             if version is None:
                 continue
 
             seen_uniprot.add(uniprot)
-            record = {
+            candidates.append({
                 "name": details["name"],
                 "type": type_label,
                 "pdb_id": details["pdb_id"],
                 "pdb_chain": details["pdb_chain"],
                 "uniprot": uniprot,
-            }
-            selected.append(record)
-            print("  [{0:>8}] {1}_{2} {3} ({4} aa) AF:{5}  {6}".format(
-                type_label, record["pdb_id"], record["pdb_chain"],
-                uniprot, length, version, record["name"]))
+                "length": length,
+                "sequence": details["sequence"],
+                "af_version": version,
+            })
+        print("  examined {0} entities, gathered {1} viable {2} candidates.".format(
+            examined, len(candidates), type_label))
 
     except Exception as exc:
         print("  SEARCH ERROR for {0}: {1}".format(type_label, exc))
-        print("  Returning {0} partial result(s) gathered before the error.".format(
-            len(selected)))
+        print("  Returning {0} partial candidate(s) gathered before the error.".format(
+            len(candidates)))
 
-    print("  -> {0} {1} proteins selected.".format(len(selected), type_label))
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Disorder estimation and binning.
+# ---------------------------------------------------------------------------
+def disorder_bin(disorder_pct):
+    """Bucket a disorder percentage into 0-25 / 25-50 / 50-75 / 75-100."""
+    if disorder_pct is None:
+        return None
+    if disorder_pct < 25:
+        return "0-25"
+    if disorder_pct < 50:
+        return "25-50"
+    if disorder_pct < 75:
+        return "50-75"
+    return "75-100"
+
+
+def _fraction_disordered(scores, threshold):
+    """Fraction of per-residue scores at or above threshold (pure Python)."""
+    values = list(scores)
+    if not values:
+        return None
+    hits = sum(1 for x in values if float(x) >= threshold)
+    return hits / len(values)
+
+
+def predict_disorder_fractions(sequences):
+    """Return a disorder fraction (0 to 1) per sequence, or None where it fails.
+
+    Uses metapredict's batch predictor for speed, falling back to per-sequence
+    prediction if the batch call is unavailable.
+    """
+    threshold = CONFIG["disorder_threshold"]
+    fractions = [None] * len(sequences)
+    try:
+        batch = _metapredict.predict_disorder_batch(sequences)
+        for idx, item in enumerate(batch):
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                scores = item[1]
+            else:
+                scores = item
+            fractions[idx] = _fraction_disordered(scores, threshold)
+        return fractions
+    except Exception as exc:
+        print("  batch disorder prediction failed ({0}); using per-sequence.".format(exc))
+
+    for idx, seq in enumerate(sequences):
+        try:
+            scores = _metapredict.predict_disorder(seq)
+            if hasattr(scores, "disorder"):
+                scores = scores.disorder
+            fractions[idx] = _fraction_disordered(scores, threshold)
+        except Exception:
+            fractions[idx] = None
+    return fractions
+
+
+def assign_disorder(candidates):
+    """Attach disorder_frac and bin to each candidate. Return True if computed."""
+    if not METAPREDICT_OK or not candidates:
+        for c in candidates:
+            c["disorder_frac"] = None
+            c["bin"] = None
+        return False
+
+    print("\nEstimating disorder for {0} candidates with metapredict.".format(
+        len(candidates)))
+    fractions = predict_disorder_fractions([c["sequence"] for c in candidates])
+    for c, frac in zip(candidates, fractions):
+        c["disorder_frac"] = frac
+        c["bin"] = disorder_bin(frac * 100.0) if frac is not None else None
+    scored = sum(1 for c in candidates if c["bin"] is not None)
+    print("  disorder scored for {0} of {1} candidates.".format(scored, len(candidates)))
+    return scored > 0
+
+
+# ---------------------------------------------------------------------------
+# Balanced selection across disorder bins and types.
+# ---------------------------------------------------------------------------
+def balanced_select(candidates, target_total):
+    """Select proteins to fill the disorder bins as evenly as data allows.
+
+    Each (bin, type) cell is capped at target_total / (bins * types), taken
+    symmetrically for viral and cellular so the target is balanced within every
+    bin; where the data is short of the cap, the cell simply holds fewer.
+    """
+    per_cell = max(1, target_total // (len(DISORDER_BINS) * len(GROUP_TYPES)))
+    buckets = {(b, t): [] for b in DISORDER_BINS for t in GROUP_TYPES}
+    for c in candidates:
+        if c.get("bin") in DISORDER_BINS:
+            buckets[(c["bin"], c["type"])].append(c)
+
+    selected = []
+    for b in DISORDER_BINS:
+        for t in GROUP_TYPES:
+            selected.extend(buckets[(b, t)][:per_cell])
+    return selected, per_cell
+
+
+def fallback_select(candidates, target_total):
+    """Select the first target_total/2 candidates per type (no disorder data)."""
+    per_group = max(1, target_total // len(GROUP_TYPES))
+    selected = []
+    for t in GROUP_TYPES:
+        group = [c for c in candidates if c["type"] == t]
+        selected.extend(group[:per_group])
     return selected
+
+
+def print_balance_table(candidates, selected, per_cell):
+    """Print selected vs available counts per disorder bin per type."""
+    available = {(b, t): 0 for b in DISORDER_BINS for t in GROUP_TYPES}
+    chosen = {(b, t): 0 for b in DISORDER_BINS for t in GROUP_TYPES}
+    for c in candidates:
+        if c.get("bin") in DISORDER_BINS:
+            available[(c["bin"], c["type"])] += 1
+    for c in selected:
+        chosen[(c["bin"], c["type"])] += 1
+
+    print("\nFinal counts per disorder bin per type "
+          "(selected / available, cap {0} per cell):".format(per_cell))
+    print("  {0:10} {1:>18} {2:>18} {3:>8}".format(
+        "bin", "viral", "cellular", "total"))
+    for b in DISORDER_BINS:
+        v, c = chosen[(b, "viral")], chosen[(b, "cellular")]
+        print("  {0:10} {1:>18} {2:>18} {3:>8}".format(
+            b,
+            "{0} / {1}".format(v, available[(b, "viral")]),
+            "{0} / {1}".format(c, available[(b, "cellular")]),
+            v + c))
+    tv = sum(chosen[(b, "viral")] for b in DISORDER_BINS)
+    tc = sum(chosen[(b, "cellular")] for b in DISORDER_BINS)
+    print("  {0:10} {1:>18} {2:>18} {3:>8}".format("TOTAL", tv, tc, tv + tc))
 
 
 # ---------------------------------------------------------------------------
@@ -289,27 +468,35 @@ def select_group(type_label, taxonomy_id):
 # ---------------------------------------------------------------------------
 def main():
     print("Building protein registry from RCSB.")
-    print("Caps: {0} per group, length {1}-{2} aa, resolution <= {3} A.".format(
-        CONFIG["per_group_cap"], CONFIG["min_length"],
+    print("Target total {0}, length {1}-{2} aa, resolution <= {3} A.".format(
+        CONFIG["target_total"], CONFIG["min_length"],
         CONFIG["max_length"], CONFIG["max_resolution"]))
 
-    all_records = []
+    candidates = []
     for type_label, taxonomy_id in CONFIG["taxonomy"].items():
-        all_records.extend(select_group(type_label, taxonomy_id))
+        candidates.extend(gather_candidates(type_label, taxonomy_id))
+
+    disorder_ok = assign_disorder(candidates)
+    if disorder_ok:
+        selected, per_cell = balanced_select(candidates, CONFIG["target_total"])
+        print_balance_table(candidates, selected, per_cell)
+    else:
+        print("\nSelecting without disorder balancing (metapredict unavailable).")
+        selected = fallback_select(candidates, CONFIG["target_total"])
 
     out = CONFIG["output_csv"]
+    fieldnames = ["name", "type", "pdb_id", "pdb_chain", "uniprot"]
     with open(out, "w", newline="") as handle:
-        writer = csv.DictWriter(
-            handle, fieldnames=["name", "type", "pdb_id", "pdb_chain", "uniprot"])
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        for record in all_records:
-            writer.writerow(record)
+        for record in selected:
+            writer.writerow({k: record[k] for k in fieldnames})
 
     counts = {}
-    for record in all_records:
+    for record in selected:
         counts[record["type"]] = counts.get(record["type"], 0) + 1
     print("\nWrote {0} proteins to {1}: {2}".format(
-        len(all_records), out,
+        len(selected), out,
         ", ".join("{0}={1}".format(k, v) for k, v in counts.items()) or "none"))
 
 

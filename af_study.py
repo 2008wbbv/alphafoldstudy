@@ -314,8 +314,8 @@ def stage1_download(registry):
 # ---------------------------------------------------------------------------
 # Stage 2: metrics.
 # ---------------------------------------------------------------------------
-def load_chain(path, chain_id):
-    """Return (Bio chain, CA coords, sequence) for chain_id in a structure.
+def get_chain(path, chain_id):
+    """Return the requested Bio chain from a structure file.
 
     Uses tmtools' loader for PDB files and Biopython's MMCIFParser for mmCIF.
     Both parsers expose author chain IDs, so chain_id matches the registry.
@@ -327,11 +327,46 @@ def load_chain(path, chain_id):
         structure = get_structure(path)
     model = next(structure.get_models())
     if chain_id in model:
-        chain = model[chain_id]
-    else:
-        chain = next(model.get_chains())
+        return model[chain_id]
+    return next(model.get_chains())
+
+
+def load_chain(path, chain_id):
+    """Return (Bio chain, CA coords, sequence) for chain_id in a structure."""
+    chain = get_chain(path, chain_id)
     coords, seq = get_residue_data(chain)
     return chain, coords, seq
+
+
+def residue_level_data(chain):
+    """Return (coords, seq, resnums, bfactors) parallel across CA residues.
+
+    Matches the residue set used by tmtools.get_residue_data (standard residues
+    that carry a CA atom) so the CA coordinates, author residue numbers and CA
+    B-factors all line up index for index.
+    """
+    coords, seq = get_residue_data(chain)
+    resnums, bfactors = [], []
+    for residue in chain.get_residues():
+        if residue.id[0] == " " and "CA" in residue.child_dict:
+            resnums.append(residue.id[1])
+            bfactors.append(float(residue.child_dict["CA"].get_bfactor()))
+    if len(resnums) != len(coords):
+        raise ValueError("residue numbering and coordinate counts disagree")
+    return coords, seq, resnums, bfactors
+
+
+def per_residue_disorder(sequence):
+    """Per-residue metapredict disorder scores as a numpy array, or None."""
+    if not METAPREDICT_OK or not sequence:
+        return None
+    try:
+        scores = _metapredict.predict_disorder(sequence)
+        if hasattr(scores, "disorder"):
+            scores = scores.disorder
+        return np.asarray(scores, dtype=float)
+    except Exception:
+        return None
 
 
 def mean_plddt(af_chain):
@@ -511,6 +546,199 @@ def _fmt(value, nd=4):
     if isinstance(value, float):
         return "{0:.{1}f}".format(value, nd)
     return str(value)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2b: per-residue analysis.
+# ---------------------------------------------------------------------------
+PER_RESIDUE_FIELDS = [
+    "name", "type", "residue_index", "ca_distance", "plddt", "disorder_score",
+]
+
+
+def _per_residue_rows(protein):
+    """Return per-residue records for one ok protein, or raise on failure.
+
+    Re-runs the TM-align superposition, walks the residue-level alignment it
+    returns, and for every aligned experimental/AF residue pair records the CA
+    distance after superposition, the AF pLDDT and the metapredict disorder
+    score at that experimental position.
+    """
+    exp_path = local_structure_path(experimental_prefix(protein["pdb_id"]))
+    af_path = local_structure_path(alphafold_prefix(protein["uniprot"]))
+    if exp_path is None or af_path is None:
+        raise FileNotFoundError("structure file missing")
+
+    exp_chain = get_chain(exp_path, protein["pdb_chain"])
+    af_chain = get_chain(af_path, "A")
+    exp_coords, exp_seq, exp_resnums, _ = residue_level_data(exp_chain)
+    af_coords, af_seq, _, af_bfactors = residue_level_data(af_chain)
+    if len(exp_seq) == 0 or len(af_seq) == 0:
+        raise ValueError("empty chain after parsing")
+
+    result = tm_align(exp_coords, af_coords, exp_seq, af_seq)
+    rot = np.asarray(result.u)
+    trans = np.asarray(result.t)
+    disorder = per_residue_disorder(exp_seq)
+
+    records = []
+    i = j = 0
+    for res_x, res_y in zip(result.seqxA, result.seqyA):
+        if res_x != "-" and res_y != "-":
+            # Superimpose the experimental CA onto the AF frame (u @ x + t) and
+            # measure the residual distance to its aligned AF CA.
+            moved = rot @ exp_coords[i] + trans
+            distance = float(np.linalg.norm(moved - af_coords[j]))
+            dscore = None
+            if disorder is not None and i < len(disorder):
+                dscore = float(disorder[i])
+            records.append({
+                "name": protein["name"],
+                "type": protein["type"],
+                "residue_index": exp_resnums[i],
+                "ca_distance": distance,
+                "plddt": af_bfactors[j],
+                "disorder_score": dscore,
+            })
+        if res_x != "-":
+            i += 1
+        if res_y != "-":
+            j += 1
+    return records
+
+
+def _spearman_line(emit, label, xs, ys):
+    """Emit a Spearman correlation for paired arrays, guarding small samples."""
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    mask = ~(np.isnan(xs) | np.isnan(ys))
+    xs, ys = xs[mask], ys[mask]
+    emit("Spearman: {0}".format(label))
+    if len(xs) >= 3 and np.std(xs) > 0 and np.std(ys) > 0:
+        rho, p_value = spearmanr(xs, ys)
+        emit("  rho = {0:+.3f}, p = {1:.4g} (n={2} residues)".format(rho, p_value, len(xs)))
+    else:
+        emit("  Insufficient or constant data (n={0}).".format(len(xs)))
+    emit("")
+
+
+def stage_per_residue(rows):
+    """Build the per-residue table, its statistics and a hexbin figure."""
+    print("\n=== Stage 2b: per-residue analysis ===")
+    os.makedirs(CONFIG["results_dir"], exist_ok=True)
+
+    per_residue = []
+    used, skipped = 0, 0
+    for protein in rows:
+        if protein["status"] != "ok":
+            continue
+        try:
+            records = _per_residue_rows(protein)
+            per_residue.extend(records)
+            used += 1
+        except Exception as exc:
+            skipped += 1
+            print("  per-residue skipped for {0}: {1}".format(protein["name"], exc))
+    print("  Built {0} residues from {1} proteins ({2} skipped).".format(
+        len(per_residue), used, skipped))
+
+    out_csv = os.path.join(CONFIG["results_dir"], "per_residue.csv")
+    with open(out_csv, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PER_RESIDUE_FIELDS)
+        writer.writeheader()
+        for row in per_residue:
+            writer.writerow({k: _fmt(row[k]) for k in PER_RESIDUE_FIELDS})
+    print("  Wrote {0}.".format(out_csv))
+
+    _per_residue_stats(per_residue)
+    _per_residue_figure(per_residue)
+
+
+def _per_residue_stats(per_residue):
+    """Correlations and a disordered-vs-ordered comparison over all residues."""
+    lines = []
+
+    def emit(text=""):
+        print(text)
+        lines.append(text)
+
+    dist = np.array([r["ca_distance"] for r in per_residue], dtype=float)
+    plddt = np.array([r["plddt"] if r["plddt"] is not None else np.nan
+                      for r in per_residue], dtype=float)
+    disorder = np.array([r["disorder_score"] if r["disorder_score"] is not None else np.nan
+                         for r in per_residue], dtype=float)
+    types = np.array([r["type"] for r in per_residue])
+
+    emit("Per-residue analysis of local AlphaFold error")
+    emit("Local error is the CA-CA distance after TM-align superposition.")
+    emit("Exploratory; residues within a protein are not independent.")
+    emit("")
+    emit("Total residues: {0}".format(len(per_residue)))
+    emit("  with a disorder score: {0}".format(int(np.sum(~np.isnan(disorder)))))
+    emit("")
+
+    _spearman_line(emit, "disorder score vs CA distance (all residues)", disorder, dist)
+    _spearman_line(emit, "pLDDT vs CA distance (all residues)", plddt, dist)
+    for label in ["viral", "cellular"]:
+        sel = types == label
+        _spearman_line(emit, "disorder score vs CA distance ({0} only)".format(label),
+                       disorder[sel], dist[sel])
+        _spearman_line(emit, "pLDDT vs CA distance ({0} only)".format(label),
+                       plddt[sel], dist[sel])
+
+    emit("Disordered (score >= 0.5) vs ordered (< 0.5) residues, CA distance")
+    valid = ~np.isnan(disorder)
+    dis_dist = dist[valid & (disorder >= 0.5)]
+    ord_dist = dist[valid & (disorder < 0.5)]
+    if len(dis_dist) >= 1 and len(ord_dist) >= 1:
+        emit("  median disordered = {0:.3f} A (n={1})".format(
+            float(np.median(dis_dist)), len(dis_dist)))
+        emit("  median ordered    = {0:.3f} A (n={1})".format(
+            float(np.median(ord_dist)), len(ord_dist)))
+        if len(dis_dist) >= 2 and len(ord_dist) >= 2:
+            u_stat, p_value = mannwhitneyu(dis_dist, ord_dist, alternative="two-sided")
+            r_rb = rank_biserial(u_stat, len(dis_dist), len(ord_dist))
+            emit("  Mann-Whitney U = {0:.1f}, p = {1:.4g}".format(u_stat, p_value))
+            emit("  rank-biserial r = {0:+.3f} (positive: disordered residues have".format(r_rb))
+            emit("  larger local error)")
+        else:
+            emit("  Not enough residues in both groups for the U test.")
+    else:
+        emit("  No disorder scores available (metapredict may be unavailable).")
+    emit("")
+
+    out = os.path.join(CONFIG["results_dir"], "per_residue_stats.txt")
+    with open(out, "w") as handle:
+        handle.write("\n".join(lines) + "\n")
+    print("  Wrote {0}.".format(out))
+
+
+def _per_residue_figure(per_residue):
+    """Hexbin of per-residue CA distance vs per-residue disorder score."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xs = np.array([r["disorder_score"] for r in per_residue
+                   if r["disorder_score"] is not None], dtype=float)
+    ys = np.array([r["ca_distance"] for r in per_residue
+                   if r["disorder_score"] is not None], dtype=float)
+    out = os.path.join(CONFIG["results_dir"], "per_residue_disorder_hexbin.png")
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    if len(xs) >= 10:
+        hb = ax.hexbin(xs, ys, gridsize=40, bins="log", cmap="viridis", mincnt=1)
+        fig.colorbar(hb, ax=ax, label="log10(residue count)")
+    else:
+        ax.text(0.5, 0.5, "not enough residues with disorder scores",
+                ha="center", va="center", transform=ax.transAxes)
+    ax.set_xlabel("per-residue disorder score")
+    ax.set_ylabel("per-residue CA distance (A)")
+    ax.set_title("Local AlphaFold error vs disorder (per residue)")
+    fig.tight_layout()
+    fig.savefig(out, dpi=CONFIG["figure_dpi"])
+    plt.close(fig)
+    print("  Wrote {0}.".format(out))
 
 
 # ---------------------------------------------------------------------------
@@ -883,11 +1111,13 @@ def main():
     registry = load_registry()
     stage1_download(registry)
     rows = stage2_metrics(registry)
+    stage_per_residue(rows)
     stage3_stats(rows)
     stage4_figures(rows)
     stage5_regression(rows)
-    print("\nDone. See {0} for metrics.csv, stats.txt, regression.txt and figures.".format(
+    print("\nDone. See {0} for metrics.csv, per_residue.csv, stats.txt,".format(
         CONFIG["results_dir"]))
+    print("regression.txt and figures.")
 
 
 if __name__ == "__main__":
