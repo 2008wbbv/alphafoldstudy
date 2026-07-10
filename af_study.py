@@ -1106,8 +1106,18 @@ def stage5_regression(rows):
 # ---------------------------------------------------------------------------
 # Main.
 # ---------------------------------------------------------------------------
-def main():
+def main(registry_csv=None, results_dir=None):
+    # Optional overrides let one invocation process a batch registry into its own
+    # results subfolder (used by the HPC batch scripts). With no arguments the
+    # behavior is unchanged: proteins.csv into ./results.
+    if registry_csv:
+        CONFIG["registry_csv"] = registry_csv
+    if results_dir:
+        CONFIG["results_dir"] = results_dir
+
     print("AlphaFold viral vs cellular accuracy study")
+    print("Registry: {0} | results: {1}".format(
+        CONFIG["registry_csv"], CONFIG["results_dir"]))
     registry = load_registry()
     stage1_download(registry)
     rows = stage2_metrics(registry)
@@ -1121,4 +1131,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run the AlphaFold viral vs cellular accuracy study.")
+    parser.add_argument(
+        "--registry", default=None,
+        help="registry CSV to read (default: proteins.csv, or the built-in list)")
+    parser.add_argument(
+        "--results-dir", default=None,
+        help="directory for outputs (default: ./results)")
+    args = parser.parse_args()
+    main(args.registry, args.results_dir)
