@@ -148,6 +148,7 @@ CONFIG = {
 
     # Endpoints.
     "data_api_url": "https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb}/{entity}",
+    "entry_api_url": "https://data.rcsb.org/rest/v1/core/entry/{pdb}",
     "af_url": "https://alphafold.ebi.ac.uk/files/AF-{uniprot}-F1-model_{version}.pdb",
     "af_api_url": "https://alphafold.ebi.ac.uk/api/prediction/{uniprot}",
 
@@ -262,6 +263,29 @@ def af_model_exists(uniprot):
 # ---------------------------------------------------------------------------
 # Gather viable candidates for one group.
 # ---------------------------------------------------------------------------
+def fetch_resolution(pdb_id):
+    """Best-effort resolution in Angstrom for a PDB entry, or None.
+
+    Read from the entry-level REST record so the value can be written into the
+    registry, which lets make_batches.py filter on resolution without needing
+    the downloaded structure files.
+    """
+    url = CONFIG["entry_api_url"].format(pdb=pdb_id)
+    try:
+        resp = requests.get(url, timeout=CONFIG["request_timeout"])
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None
+    values = (data.get("rcsb_entry_info", {}) or {}).get("resolution_combined") or []
+    if values:
+        try:
+            return float(values[0])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def gather_candidates(type_label, taxonomy_id):
     """Gather viable candidates for one group (no disorder binning yet).
 
@@ -307,6 +331,9 @@ def gather_candidates(type_label, taxonomy_id):
             if version is None:
                 continue
 
+            resolution = fetch_resolution(details["pdb_id"])
+            time.sleep(CONFIG["request_sleep"])
+
             seen_uniprot.add(uniprot)
             candidates.append({
                 "name": details["name"],
@@ -317,6 +344,7 @@ def gather_candidates(type_label, taxonomy_id):
                 "length": length,
                 "sequence": details["sequence"],
                 "af_version": version,
+                "resolution": resolution,
             })
         print("  examined {0} entities, gathered {1} viable {2} candidates.".format(
             examined, len(candidates), type_label))
@@ -485,12 +513,15 @@ def main():
         selected = fallback_select(candidates, CONFIG["target_total"])
 
     out = CONFIG["output_csv"]
-    fieldnames = ["name", "type", "pdb_id", "pdb_chain", "uniprot"]
+    fieldnames = ["name", "type", "pdb_id", "pdb_chain", "uniprot", "resolution"]
     with open(out, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for record in selected:
-            writer.writerow({k: record[k] for k in fieldnames})
+            row = {k: record.get(k) for k in fieldnames}
+            res = row.get("resolution")
+            row["resolution"] = "" if res is None else "{0:.2f}".format(res)
+            writer.writerow(row)
 
     counts = {}
     for record in selected:
