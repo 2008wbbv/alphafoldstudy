@@ -23,9 +23,11 @@ import re
 
 CONFIG = {
     "input_csv": "proteins.csv",
-    "out_dir": "batches",
+    "out_dir": "jobs",
     "log_dir": "logs",
     "data_dir": "data",
+    # Path (from the repo root) to the analysis entry point the jobs invoke.
+    "af_study_path": "src/af_study.py",
     "batch_size": 250,
     "max_resolution": 3.0,
     # Column names that may carry a resolution value in the registry CSV.
@@ -120,7 +122,7 @@ mkdir -p {results_dir} {log_dir}
 # module load python/3.11                 # <- edit for your cluster
 # source /path/to/your/venv/bin/activate  # <- edit for your cluster
 
-python af_study.py --registry {batch_csv} --results-dir {results_dir}
+python {af_study} --registry {batch_csv} --results-dir {results_dir}
 """.format(
         job=job_name,
         time=cfg["time"],
@@ -129,6 +131,7 @@ python af_study.py --registry {batch_csv} --results-dir {results_dir}
         log_dir=log_dir,
         results_dir=results_dir,
         batch_csv=batch_csv,
+        af_study=CONFIG["af_study_path"],
     )
 
 
