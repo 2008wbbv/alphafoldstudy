@@ -6,10 +6,12 @@ proteins by measuring AlphaFold models against experimental PDB structures.
 
 The whole study runs top to bottom in this one file:
 
-  Stage 1  Download experimental (RCSB) and AlphaFold structures into ./data
-  Stage 2  Compute per-protein metrics into ./results/metrics.csv
-  Stage 3  Run exploratory statistics into ./results/stats.txt
-  Stage 4  Render three figures into ./results/
+  Stage 1   Download experimental (RCSB) and AlphaFold structures into ./data
+  Stage 2   Per-protein metrics into ./results/metrics.csv
+  Stage 2b  Per-residue table, statistics and hexbin figure into ./results/
+  Stage 3   Exploratory statistics into ./results/stats.txt
+  Stage 4   Render the three per-protein figures into ./results/
+  Stage 5   Multiple regression into ./results/regression.txt
 
 The protein registry comes from proteins.csv when present (see
 build_registry.py); otherwise a small built-in list is used so the script
@@ -20,6 +22,7 @@ The script is idempotent: existing downloads are reused, and results are
 overwritten on every run.
 
 Run with:  python af_study.py
+           python af_study.py --registry jobs/batch_01.csv --results-dir results/batch_01
 """
 
 import csv
@@ -396,20 +399,15 @@ def missing_fraction(exp_chain):
 
 
 def compute_disorder(sequence):
-    """Fraction of residues predicted disordered by metapredict, or None."""
-    if not METAPREDICT_OK or not sequence:
+    """Fraction of residues predicted disordered by metapredict, or None.
+
+    The per-protein summary of per_residue_disorder: the share of residues
+    scoring at or above the disorder threshold.
+    """
+    scores = per_residue_disorder(sequence)
+    if scores is None or scores.size == 0:
         return None
-    try:
-        scores = _metapredict.predict_disorder(sequence)
-        if hasattr(scores, "disorder"):
-            scores = scores.disorder
-        scores = np.asarray(scores, dtype=float)
-        if scores.size == 0:
-            return None
-        return float(np.mean(scores >= CONFIG["disorder_threshold"]))
-    except Exception as exc:
-        print("  disorder prediction failed: {0}".format(exc))
-        return None
+    return float(np.mean(scores >= CONFIG["disorder_threshold"]))
 
 
 def disorder_bin(disorder_pct):
