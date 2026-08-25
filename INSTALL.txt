@@ -1,0 +1,239 @@
+===============================================================================
+ AlphaFold viral vs cellular accuracy study
+ INSTALLATION AND SETUP
+===============================================================================
+
+Plain text, no assumptions. Follow it top to bottom.
+
+If you only read one thing, read the QUICK VERSION.
+
+
+-------------------------------------------------------------------------------
+ QUICK VERSION
+-------------------------------------------------------------------------------
+
+  git clone https://github.com/2008wbbv/alphafoldstudy.git
+  cd alphafoldstudy
+  bash setup_env.sh
+
+That is the whole install. The script installs Miniconda if the machine does not
+already have conda, builds the environment, and checks that every package
+imports.
+
+Then, in any new terminal:
+
+  source ~/miniconda3/etc/profile.d/conda.sh
+  conda activate alphafold-study
+  python src/af_study.py
+
+
+-------------------------------------------------------------------------------
+ WHAT GETS INSTALLED, AND WHERE
+-------------------------------------------------------------------------------
+
+  Miniconda        ~/miniconda3                  (only if conda is missing)
+  The environment  ~/miniconda3/envs/alphafold-study
+  Package cache    ~/miniconda3/pkgs
+  Pip wheel cache  ~/.cache/pip
+
+Total size is roughly 5 GB. Most of that is PyTorch, which the disorder
+predictor needs.
+
+To put it somewhere else, for example on a cluster where your home directory
+has a quota, set CONDA_ROOT before running the script:
+
+  export CONDA_ROOT=/scratch/$USER/miniconda3
+  bash setup_env.sh
+
+Nothing is installed system wide and nothing needs sudo. Your shell startup
+files are not modified, which is why every new terminal needs the two
+activation lines shown above.
+
+
+-------------------------------------------------------------------------------
+ STEP BY STEP
+-------------------------------------------------------------------------------
+
+STEP 1. Get the code.
+
+  git clone https://github.com/2008wbbv/alphafoldstudy.git
+  cd alphafoldstudy
+
+STEP 2. Build the environment.
+
+  bash setup_env.sh
+
+  This prints four steps as it goes:
+    [1/4] Locating conda        installs Miniconda if it is missing
+    [2/4] Creating environment  builds alphafold-study from environment.yml
+    [3/4] Verifying imports     confirms all ten packages load
+    [4/4] Structure cache       skipped unless you pass --download
+
+  Expect five to fifteen minutes, mostly downloading PyTorch.
+
+  Re-running the script is safe. It detects what already exists and updates
+  rather than reinstalling.
+
+STEP 3. Activate it.
+
+  source ~/miniconda3/etc/profile.d/conda.sh
+  conda activate alphafold-study
+
+  If you set CONDA_ROOT in step 2, use that path instead of ~/miniconda3.
+
+  Your prompt should now start with (alphafold-study).
+
+STEP 4. Run something.
+
+  python src/af_study.py
+
+  This downloads structures into ./data and writes results into ./results.
+  It is safe to interrupt and re-run: downloads are cached and reused.
+
+
+-------------------------------------------------------------------------------
+ RUNNING ON A CLUSTER
+-------------------------------------------------------------------------------
+
+The important constraint: compute nodes usually have NO internet access. Both
+the package install and the structure downloads have to happen on a login node.
+The jobs then read everything from shared storage.
+
+ON THE LOGIN NODE:
+
+  1. Clone the repo somewhere shared, visible to the compute nodes.
+
+  2. Point conda at space that has room, if home is small.
+
+       export CONDA_ROOT=/scratch/$USER/miniconda3
+
+  3. Install and pre-download in one command.
+
+       bash setup_env.sh --download
+
+     The --download flag builds the protein registry if needed, then fetches
+     every structure into ./data. This is the step that makes the jobs able to
+     run offline.
+
+  4. Generate the job files.
+
+       conda activate alphafold-study
+       python src/make_batches.py
+
+     This writes jobs/batch_01.csv, jobs/batch_01.sh, and so on, 250 proteins
+     per batch.
+
+  5. Edit each jobs/batch_NN.sh before submitting. Three things:
+
+       a) Account and partition. Uncomment and fill in:
+            #SBATCH --account=YOUR_ACCOUNT
+            #SBATCH --partition=YOUR_PARTITION
+
+       b) Environment activation. Uncomment and correct the path:
+            source /scratch/$USER/miniconda3/etc/profile.d/conda.sh
+            conda activate alphafold-study
+
+       c) Time, memory and CPUs, if the defaults do not suit your cluster.
+          They ship as 12 hours, 16 GB, 4 CPUs.
+
+  6. Submit.
+
+       sbatch jobs/batch_01.sh
+
+  7. When the jobs finish, merge the per batch outputs.
+
+       python src/merge_results.py
+
+     This writes results/combined_metrics.csv and
+     results/combined_per_residue.csv.
+
+
+-------------------------------------------------------------------------------
+ WHAT EACH SCRIPT DOES
+-------------------------------------------------------------------------------
+
+  src/build_registry.py   Picks the proteins from the RCSB database and writes
+                          proteins.csv. Excludes polyprotein fragments and
+                          balances the sample across disorder levels.
+                          Checkpoints as it goes, so an interrupted run resumes
+                          instead of starting over.
+
+  src/af_study.py         The study itself. Downloads structures, computes
+                          TM-score, RMSD, pLDDT, disorder and coverage, runs the
+                          per residue analysis, the statistics, the figures and
+                          the regression.
+
+                          Options:
+                            --registry PATH      which protein list to read
+                            --results-dir PATH   where to write output
+
+  src/compare_metrics.py  Three panel box chart of TM-score, pLDDT and disorder,
+                          viral against cellular, with a Mann-Whitney test on
+                          each panel.
+
+  src/extra_stats.py      Appends extra robustness tests to results/stats.txt.
+
+  src/make_captions.py    Writes figure captions using the numbers already in
+                          the results files.
+
+  src/make_batches.py     Splits proteins.csv into cluster job batches.
+
+  src/merge_results.py    Recombines per batch outputs into single tables.
+
+Run every command from the repository root, not from inside src/.
+
+
+-------------------------------------------------------------------------------
+ TROUBLESHOOTING
+-------------------------------------------------------------------------------
+
+"conda: command not found" after installing
+
+  The installer does not modify your shell startup files. Run:
+    source ~/miniconda3/etc/profile.d/conda.sh
+  Add that line to your ~/.bashrc if you want it automatic.
+
+"CondaToSNonInteractiveError: Terms of Service have not been accepted"
+
+  Conda 25 and newer will not install anything until Anaconda's channel terms
+  are accepted. setup_env.sh does this for you, so you should only hit this if
+  you ran conda by hand. Fix it with:
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+"CondaHTTPError" or the download stalls
+
+  Usually a proxy or an offline compute node. Confirm you are on a login node
+  with internet access. Test with:
+    curl -sI https://repo.anaconda.com | head -1
+
+"No space left on device"
+
+  Conda plus PyTorch needs about 5 GB. Move the install:
+    export CONDA_ROOT=/scratch/$USER/miniconda3
+    bash setup_env.sh
+  Check your quota with: quota -s      or      du -sh ~
+
+metapredict fails to import
+
+  It depends on PyTorch. Reinstall the CPU build inside the environment:
+    conda activate alphafold-study
+    pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cpu
+
+The registry build seems to hang
+
+  It is not hung. It prints progress only every 25 entities examined, and
+  viable viral candidates are rare, so long silences are normal. Progress is
+  checkpointed to .registry_checkpoint.json, so you can stop it and start it
+  again without losing work. Delete that file to force a clean rebuild.
+
+A job dies on the cluster with a network error
+
+  The structures were not pre-downloaded. On a login node run:
+    bash setup_env.sh --download
+  then resubmit.
+
+Removing everything
+
+  conda env remove -n alphafold-study
+  rm -rf ~/miniconda3          (only if this project installed it)

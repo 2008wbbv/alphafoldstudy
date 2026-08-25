@@ -1,0 +1,45 @@
+# Conda environment for the AlphaFold viral vs cellular accuracy study.
+#
+#   conda env create -f environment.yml
+#   conda activate alphafold-study
+#
+# Or let setup_env.sh do it for you, which also installs Miniconda if the
+# machine does not already have conda:
+#
+#   bash setup_env.sh
+#
+# Heavy scientific packages come from conda-forge, which ships prebuilt binaries
+# and avoids compiling anything. The last few are pip-only.
+#
+# PyTorch is pinned to the CPU build on purpose: metapredict needs torch, but
+# nothing in this project uses a GPU, and the CUDA build is several gigabytes
+# larger. That matters on a cluster home directory with a quota.
+
+name: alphafold-study
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+
+  # Scientific stack
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib-base
+  - statsmodels
+  - biopython
+  - requests
+
+  # metapredict's backend, CPU only
+  - pytorch-cpu
+
+  - pip
+  - pip:
+      # TM-align bindings, used for structure superposition
+      - tmtools
+      # RCSB structured search client, used to build the protein registry
+      - rcsb-api
+      # Disorder prediction
+      - metapredict

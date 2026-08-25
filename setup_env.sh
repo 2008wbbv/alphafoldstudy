@@ -2,41 +2,38 @@
 # =============================================================================
 # setup_env.sh
 #
-# Creates the conda environment this project needs, on a login node.
+# One command to get from a fresh clone to a working environment.
 #
-# Run this ONCE before submitting any jobs. Compute nodes on most clusters have
-# no outbound network access, so both the package install and the structure
-# downloads have to happen here, on a node that does. The batch jobs then only
-# read from shared storage.
+#   bash setup_env.sh              install Miniconda if needed, build the env
+#   bash setup_env.sh --download   also pre-download every structure
+#   bash setup_env.sh --help       show options
 #
-#   bash setup_env.sh              # create the environment
-#   bash setup_env.sh --download   # also pre-download every structure
+# Safe to re-run. Anything already installed is detected and reused.
+#
+# On a cluster, run this on a LOGIN node. Compute nodes usually have no internet,
+# so both the package install and the structure downloads have to happen on a
+# node that does; the batch jobs then only read from shared storage.
 #
 # -----------------------------------------------------------------------------
-# EDIT THESE FOR YOUR CLUSTER BEFORE RUNNING
+# EDIT THESE IF YOUR CLUSTER NEEDS IT. The defaults work on most machines.
 # -----------------------------------------------------------------------------
 
 # Name of the environment to create.
-ENV_NAME="alphafold-study"
+ENV_NAME="${ENV_NAME:-alphafold-study}"
 
-# Python version. 3.11 is known to work with every dependency below.
-PY_VERSION="3.11"
+# Where Miniconda gets installed IF this script has to install it.
+# Home directories on clusters are often small, and conda plus PyTorch needs
+# roughly 5 GB, so point this at scratch or project space if $HOME has a quota.
+#   export CONDA_ROOT=/scratch/$USER/miniconda3
+CONDA_ROOT="${CONDA_ROOT:-$HOME/miniconda3}"
 
-# Where the environment is written. On most clusters your home directory has a
-# small quota and conda environments are large (torch alone is over 1 GB), so
-# point this at scratch or project space rather than $HOME.
-ENV_PREFIX="${HOME}/.conda/envs/${ENV_NAME}"
+# Where package archives and pip wheels are cached. Same quota warning.
+export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CONDA_ROOT/pkgs}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$HOME/.cache/pip}"
 
-# Where package downloads are cached. Same quota warning applies.
-export CONDA_PKGS_DIRS="${HOME}/.conda/pkgs"
-
-# Where pip caches wheels.
-export PIP_CACHE_DIR="${HOME}/.cache/pip"
-
-# Module providing conda. Common values: anaconda3, miniconda3, conda.
-# Run "module avail conda" to find the right name, or leave empty if conda is
-# already on your PATH.
-CONDA_MODULE="anaconda3"
+# Module that provides conda on an HPC system, if there is one. Run
+# "module avail conda" to find the name. Leave empty to skip module loading.
+CONDA_MODULE="${CONDA_MODULE:-}"
 
 # =============================================================================
 # Nothing below here normally needs editing.
@@ -44,82 +41,123 @@ CONDA_MODULE="anaconda3"
 
 set -euo pipefail
 
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_DIR"
+
+DO_DOWNLOAD=0
+for arg in "$@"; do
+    case "$arg" in
+        --download) DO_DOWNLOAD=1 ;;
+        --help|-h)
+            sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) echo "Unknown option: $arg (try --help)"; exit 1 ;;
+    esac
+done
+
 echo "=============================================="
-echo " Environment : ${ENV_NAME}"
-echo " Python      : ${PY_VERSION}"
-echo " Prefix      : ${ENV_PREFIX}"
+echo " AlphaFold study environment setup"
+echo "   repo        : $REPO_DIR"
+echo "   environment : $ENV_NAME"
 echo "=============================================="
 
-# --- Locate conda ------------------------------------------------------------
-if [ -n "${CONDA_MODULE}" ] && command -v module &> /dev/null; then
-    echo "[1/4] Loading module ${CONDA_MODULE}"
-    module load "${CONDA_MODULE}" || echo "  could not load ${CONDA_MODULE}, trying PATH"
-else
-    echo "[1/4] Skipping module load, using conda from PATH"
+# --- Step 1: find conda, or install Miniconda --------------------------------
+echo
+echo "[1/4] Locating conda"
+
+if [ -n "$CONDA_MODULE" ] && command -v module &> /dev/null; then
+    echo "  loading module $CONDA_MODULE"
+    module load "$CONDA_MODULE" 2>/dev/null || echo "  module load failed, continuing"
+fi
+
+# An installation this script made earlier will not be on PATH in a new shell.
+if ! command -v conda &> /dev/null && [ -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$CONDA_ROOT/etc/profile.d/conda.sh"
 fi
 
 if ! command -v conda &> /dev/null; then
-    echo "ERROR: conda not found."
-    echo "  Set CONDA_MODULE at the top of this script, or load conda yourself first."
-    echo "  Try: module avail conda"
-    exit 1
+    echo "  conda not found, installing Miniconda into $CONDA_ROOT"
+
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64)   MINI="Miniconda3-latest-Linux-x86_64.sh" ;;
+        Linux-aarch64)  MINI="Miniconda3-latest-Linux-aarch64.sh" ;;
+        Darwin-arm64)   MINI="Miniconda3-latest-MacOSX-arm64.sh" ;;
+        Darwin-x86_64)  MINI="Miniconda3-latest-MacOSX-x86_64.sh" ;;
+        *)
+            echo "ERROR: unsupported platform $(uname -s)-$(uname -m)."
+            echo "  Install Miniconda manually from https://docs.conda.io/en/latest/miniconda.html"
+            echo "  then re-run this script."
+            exit 1 ;;
+    esac
+
+    INSTALLER="/tmp/$MINI"
+    echo "  downloading $MINI"
+    if command -v curl &> /dev/null; then
+        curl -fsSL "https://repo.anaconda.com/miniconda/$MINI" -o "$INSTALLER"
+    elif command -v wget &> /dev/null; then
+        wget -q "https://repo.anaconda.com/miniconda/$MINI" -O "$INSTALLER"
+    else
+        echo "ERROR: neither curl nor wget is available to download Miniconda."
+        exit 1
+    fi
+
+    # -b batch mode, -p prefix. No shell profile is modified.
+    bash "$INSTALLER" -b -p "$CONDA_ROOT"
+    rm -f "$INSTALLER"
+
+    # shellcheck disable=SC1091
+    source "$CONDA_ROOT/etc/profile.d/conda.sh"
+    echo "  Miniconda installed"
 fi
+
 echo "  conda: $(command -v conda)"
 
-# Make "conda activate" work inside a non-interactive shell.
+# Make "conda activate" work inside this non-interactive shell.
 eval "$(conda shell.bash hook)"
 
-# --- Create the environment --------------------------------------------------
-if conda env list | grep -qE "^${ENV_NAME}\s|/${ENV_NAME}$"; then
-    echo "[2/4] Environment ${ENV_NAME} already exists, reusing it"
-else
-    echo "[2/4] Creating ${ENV_NAME} with Python ${PY_VERSION}"
-    conda create -y -n "${ENV_NAME}" "python=${PY_VERSION}"
+# Conda 25 and newer refuse to solve anything until the Terms of Service for
+# Anaconda's default channels have been accepted, and they fail with a hard
+# error in a non-interactive shell. That happens even though this project only
+# installs from conda-forge, because those channels stay in the default
+# configuration. Accept them up front so a fresh install does not stop here.
+# The command does not exist on older conda, hence the guard.
+if conda tos --help &> /dev/null; then
+    for tos_channel in https://repo.anaconda.com/pkgs/main \
+                       https://repo.anaconda.com/pkgs/r; do
+        conda tos accept --override-channels --channel "$tos_channel" &> /dev/null || true
+    done
+    echo "  channel terms of service accepted"
 fi
 
-conda activate "${ENV_NAME}"
+# --- Step 2: create the environment ------------------------------------------
+echo
+echo "[2/4] Creating environment"
+
+if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
+    echo "  $ENV_NAME already exists, updating it to match environment.yml"
+    conda env update -n "$ENV_NAME" -f environment.yml --prune
+else
+    echo "  building $ENV_NAME from environment.yml (this takes a few minutes)"
+    conda env create -n "$ENV_NAME" -f environment.yml
+fi
+
+conda activate "$ENV_NAME"
 echo "  python: $(command -v python) ($(python --version 2>&1))"
 
-# --- Install dependencies ----------------------------------------------------
-# Installed with pip rather than conda so the versions match what the analysis
-# was developed against. Torch is pinned to the CPU build: metapredict needs
-# torch, nothing here uses a GPU, and the CUDA build is several GB larger.
-echo "[3/4] Installing dependencies"
+# --- Step 3: verify ----------------------------------------------------------
+echo
+echo "[3/4] Verifying imports"
 
-python -m pip install --upgrade pip --quiet
-
-echo "  torch (CPU build)"
-python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
-
-echo "  scientific stack and project dependencies"
-python -m pip install --quiet \
-    numpy \
-    scipy \
-    pandas \
-    matplotlib \
-    statsmodels \
-    biopython \
-    tmtools \
-    requests \
-    rcsb-api \
-    metapredict
-
-# --- Verify ------------------------------------------------------------------
-echo "[4/4] Verifying imports"
 python - <<'PYCHECK'
 import importlib
 import sys
 
 modules = [
-    ("numpy", "numpy"),
-    ("scipy", "scipy"),
-    ("pandas", "pandas"),
-    ("matplotlib", "matplotlib"),
-    ("statsmodels", "statsmodels"),
-    ("Bio", "biopython"),
-    ("tmtools", "tmtools"),
-    ("requests", "requests"),
-    ("rcsbapi", "rcsb-api"),
+    ("numpy", "numpy"), ("scipy", "scipy"), ("pandas", "pandas"),
+    ("matplotlib", "matplotlib"), ("statsmodels", "statsmodels"),
+    ("Bio", "biopython"), ("requests", "requests"),
+    ("tmtools", "tmtools"), ("rcsbapi", "rcsb-api"),
     ("metapredict", "metapredict"),
 ]
 
@@ -127,41 +165,50 @@ failed = []
 for import_name, pip_name in modules:
     try:
         module = importlib.import_module(import_name)
-        version = getattr(module, "__version__", "ok")
-        print("  {0:<14} {1}".format(pip_name, version))
+        print("  {0:<14} {1}".format(pip_name, getattr(module, "__version__", "ok")))
     except Exception as exc:
         failed.append(pip_name)
         print("  {0:<14} FAILED: {1}".format(pip_name, exc))
 
 if failed:
     print("\nMissing: " + ", ".join(failed))
+    print("Try: conda env update -n $ENV_NAME -f environment.yml --prune")
     sys.exit(1)
 print("\nAll imports OK.")
 PYCHECK
 
-# --- Optional pre-download ---------------------------------------------------
-# Compute nodes cannot reach RCSB or the AlphaFold database, so every structure
-# has to be cached on shared storage first. af_study.py reuses whatever is
-# already in ./data, so running it here populates the cache; the batch jobs then
-# find every file present and skip straight to the analysis.
-if [ "${1:-}" = "--download" ]; then
-    echo
-    echo "Pre-downloading structures into ./data (this takes a while)"
+# --- Step 4: optional pre-download -------------------------------------------
+echo
+echo "[4/4] Structure cache"
+
+if [ "$DO_DOWNLOAD" = "1" ]; then
+    if [ ! -f proteins.csv ]; then
+        echo "  proteins.csv not found, building the registry first"
+        python src/build_registry.py
+    fi
+    echo "  downloading structures into ./data (this takes a while)"
     python src/af_study.py
-    echo "Download cache ready: $(ls data 2>/dev/null | wc -l) files in ./data"
+    echo "  cache ready: $(ls data 2>/dev/null | wc -l) files in ./data"
+else
+    echo "  skipped. Re-run with --download to populate ./data before submitting jobs."
 fi
 
-echo
-echo "=============================================="
-echo " Done."
-echo
-echo " Activate it with:"
-echo "   conda activate ${ENV_NAME}"
-echo
-echo " Then put these two lines in each jobs/batch_NN.sh:"
-echo "   module load ${CONDA_MODULE}"
-echo "   conda activate ${ENV_NAME}"
-echo
-echo " If you have not pre-downloaded yet, run:"
-echo "   bash setup_env.sh --download"
-echo "=============================================="
+# --- Done --------------------------------------------------------------------
+cat <<EOF
+
+==============================================
+ Done.
+
+ Every new shell needs these two lines:
+
+   source $CONDA_ROOT/etc/profile.d/conda.sh
+   conda activate $ENV_NAME
+
+ Then run the study:
+
+   python src/af_study.py
+
+ For cluster jobs, put the same two lines into each jobs/batch_NN.sh,
+ and fill in the account and partition at the top of those files.
+==============================================
+EOF
