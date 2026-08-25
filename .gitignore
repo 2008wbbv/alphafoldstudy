@@ -8,3 +8,6 @@ results/
 
 # Job run logs (created at submit time on the cluster)
 logs/
+
+# Registry build checkpoint (working file, delete to force a clean rebuild)
+.registry_checkpoint.json

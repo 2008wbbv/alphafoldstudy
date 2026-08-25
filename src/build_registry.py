@@ -30,6 +30,8 @@ Run with:  python build_registry.py
 
 import csv
 import importlib
+import json
+import os
 import subprocess
 import sys
 import time
@@ -125,9 +127,28 @@ CONFIG = {
     # viral proteins (and disordered crystallised proteins of either type) are
     # sparse, so the high-disorder bins usually fill less than the target; raise
     # pool_size and per_group_cap to push further into the search if needed.
-    "target_total": 300,
-    "per_group_cap": 150,
-    "pool_size": 800,
+    "target_total": 250,
+    "per_group_cap": 125,
+    "pool_size": 4000,
+
+    # Fragment exclusion, applied at selection time.
+    #
+    # The AlphaFold database serves a protein as a single model only while its
+    # UniProt sequence stays at or below this length; longer entries are split
+    # into overlapping fragments (F1, F2, ...) and the pipeline downloads F1.
+    # A crystal structure of a mature protein cleaved from a long polyprotein
+    # therefore gets compared against an F1 fragment that need not contain it,
+    # producing a near-zero TM-score that reflects a database indexing mismatch
+    # rather than a prediction failure. Viral polyproteins are the main source.
+    # Excluding long parent sequences here keeps those cases out of the dataset
+    # entirely, instead of collecting them and filtering them afterwards.
+    "af_max_single_fragment": 2700,
+    "uniprot_api_url": "https://rest.uniprot.org/uniprotkb/{accession}.json?fields=length",
+
+    # Candidate gathering checkpoints here after every accepted candidate, so a
+    # long build that is interrupted resumes instead of starting over. Delete
+    # this file to force a clean rebuild.
+    "checkpoint_json": ".registry_checkpoint.json",
 
     # A residue counts as disordered when its metapredict score is at or above
     # this threshold; the disorder fraction is binned into four quartile bins.
@@ -235,9 +256,21 @@ def resolve_entity(entity_id):
 def af_model_exists(uniprot):
     """Return a tag for the AlphaFold model source if one exists, else None.
 
-    Tries the classic UniProt-accession file URL first (the URL named in the
-    study brief), then the AlphaFold API as a fall-back.
+    The API is asked first because it settles the question in one request. The
+    versioned file URLs are the fall-back: probing those first costs up to four
+    requests per accession and nearly always fails for the viral entries, whose
+    models have moved to a hash-based naming scheme the old URLs never serve.
+    That ordering dominated the runtime of a large build.
     """
+    if CONFIG["use_af_api_fallback"]:
+        url = CONFIG["af_api_url"].format(uniprot=uniprot)
+        try:
+            resp = requests.get(url, timeout=CONFIG["request_timeout"])
+            if resp.status_code == 200 and resp.json():
+                return "api"
+        except Exception:
+            pass
+
     for version in CONFIG["af_model_versions"]:
         url = CONFIG["af_url"].format(uniprot=uniprot, version=version)
         try:
@@ -248,15 +281,6 @@ def af_model_exists(uniprot):
                 return version
         except Exception:
             continue
-
-    if CONFIG["use_af_api_fallback"]:
-        url = CONFIG["af_api_url"].format(uniprot=uniprot)
-        try:
-            resp = requests.get(url, timeout=CONFIG["request_timeout"])
-            if resp.status_code == 200 and resp.json():
-                return "api"
-        except Exception:
-            pass
     return None
 
 
@@ -286,19 +310,78 @@ def fetch_resolution(pdb_id):
     return None
 
 
-def gather_candidates(type_label, taxonomy_id):
+def fetch_uniprot_length(accession):
+    """Length of the full UniProt sequence for an accession, or None."""
+    url = CONFIG["uniprot_api_url"].format(accession=accession)
+    try:
+        resp = requests.get(url, timeout=CONFIG["request_timeout"])
+        resp.raise_for_status()
+        return int(resp.json().get("sequence", {}).get("length"))
+    except Exception:
+        return None
+
+
+def is_fragment_risk(accession):
+    """True when AlphaFold serves this accession in fragments.
+
+    A parent sequence longer than the single-model limit is split by the
+    AlphaFold database, so the fragment the pipeline downloads may not contain
+    the crystallised region at all. Those entries are excluded up front. An
+    accession whose length cannot be determined is kept, because the runtime
+    coverage check in af_study.py still guards against a mismatch.
+    """
+    length = fetch_uniprot_length(accession)
+    if length is None:
+        return False
+    return length > CONFIG["af_max_single_fragment"]
+
+
+def load_checkpoint():
+    """Return (candidates, examined_entity_ids) from a previous partial run."""
+    path = CONFIG["checkpoint_json"]
+    if not os.path.exists(path):
+        return [], set()
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+        return data.get("candidates", []), set(data.get("examined", []))
+    except Exception as exc:
+        print("  checkpoint unreadable, starting fresh: {0}".format(exc))
+        return [], set()
+
+
+def save_checkpoint(candidates, examined):
+    """Persist gathering progress so an interrupted build can resume."""
+    tmp = CONFIG["checkpoint_json"] + ".tmp"
+    try:
+        with open(tmp, "w") as handle:
+            json.dump({"candidates": candidates, "examined": sorted(examined)}, handle)
+        os.replace(tmp, CONFIG["checkpoint_json"])
+    except Exception as exc:
+        print("  could not write checkpoint: {0}".format(exc))
+
+
+def gather_candidates(type_label, taxonomy_id, prior=None, examined_ids=None):
     """Gather viable candidates for one group (no disorder binning yet).
 
-    A candidate is viable when it passes the same filters as before: one
-    representative per UniProt accession, inside the length window, with an
-    AlphaFold model. Gathering stops at per_group_cap viable candidates or
-    pool_size examined entities, whichever comes first. Returns whatever was
-    gathered even if the search raises partway through.
+    A candidate is viable when it passes every filter: one representative per
+    UniProt accession, inside the length window, not served by AlphaFold as a
+    fragment, and with an AlphaFold model that exists. Gathering resumes from
+    any prior progress and stops at per_group_cap viable candidates or
+    pool_size newly examined entities. Returns whatever was gathered even if
+    the search raises partway through.
     """
     print("\n=== Gathering {0} candidates (taxonomy {1}) ===".format(
         type_label, taxonomy_id))
-    candidates = []
-    seen_uniprot = set()
+    candidates = [c for c in (prior or []) if c["type"] == type_label]
+    seen_examined = examined_ids if examined_ids is not None else set()
+    # Accessions already accepted in ANY group, so a resumed run does not
+    # duplicate work or re-add a protein the checkpoint already holds.
+    seen_uniprot = {c["uniprot"] for c in (prior or [])}
+    if candidates:
+        print("  resuming with {0} {1} candidate(s) from checkpoint.".format(
+            len(candidates), type_label))
+    fragments_skipped = 0
 
     try:
         query = build_query(taxonomy_id)
@@ -310,7 +393,21 @@ def gather_candidates(type_label, taxonomy_id):
                 break
             if examined >= CONFIG["pool_size"]:
                 break
+            # Entities looked at on an earlier run cost nothing to skip.
+            if entity_id in seen_examined:
+                continue
             examined += 1
+            seen_examined.add(entity_id)
+            # Checkpoint the examined set periodically as well as on every
+            # acceptance. Viable candidates can be hundreds of entities apart,
+            # and without this an interrupted run re-examines everything it
+            # already rejected.
+            if examined % 25 == 0:
+                save_checkpoint(
+                    [c for c in (prior or []) if c["type"] != type_label] + candidates,
+                    seen_examined)
+                print("    ... {0} examined, {1} {2} so far ({3} fragments skipped)".format(
+                    len(seen_examined), len(candidates), type_label, fragments_skipped))
 
             details = resolve_entity(entity_id)
             time.sleep(CONFIG["request_sleep"])
@@ -326,6 +423,13 @@ def gather_candidates(type_label, taxonomy_id):
                 continue
             if not details["sequence"]:
                 continue
+
+            # Drop polyprotein-derived entries before they enter the dataset.
+            if is_fragment_risk(uniprot):
+                fragments_skipped += 1
+                time.sleep(CONFIG["request_sleep"])
+                continue
+            time.sleep(CONFIG["request_sleep"])
 
             version = af_model_exists(uniprot)
             if version is None:
@@ -346,8 +450,17 @@ def gather_candidates(type_label, taxonomy_id):
                 "af_version": version,
                 "resolution": resolution,
             })
-        print("  examined {0} entities, gathered {1} viable {2} candidates.".format(
-            examined, len(candidates), type_label))
+            # Persist after every acceptance: this build is long and is
+            # routinely interrupted, and losing it means starting over.
+            save_checkpoint(
+                [c for c in (prior or []) if c["type"] != type_label] + candidates,
+                seen_examined)
+            print("    [{0:>3}] {1} {2} ({3})".format(
+                len(candidates), details["pdb_id"], uniprot, details["name"][:44]))
+
+        print("  examined {0} new entities, {1} viable {2} candidates"
+              " ({3} excluded as AlphaFold fragments).".format(
+                  examined, len(candidates), type_label, fragments_skipped))
 
     except Exception as exc:
         print("  SEARCH ERROR for {0}: {1}".format(type_label, exc))
@@ -500,9 +613,26 @@ def main():
         CONFIG["target_total"], CONFIG["min_length"],
         CONFIG["max_length"], CONFIG["max_resolution"]))
 
-    candidates = []
+    print("Excluding entries whose UniProt sequence exceeds {0} aa, which"
+          " AlphaFold serves in fragments.".format(CONFIG["af_max_single_fragment"]))
+
+    prior, examined_ids = load_checkpoint()
+    if prior:
+        print("Resuming from checkpoint: {0} candidate(s), {1} entities already"
+              " examined.".format(len(prior), len(examined_ids)))
+
+    candidates = list(prior)
     for type_label, taxonomy_id in CONFIG["taxonomy"].items():
-        candidates.extend(gather_candidates(type_label, taxonomy_id))
+        gathered = gather_candidates(type_label, taxonomy_id, prior=candidates,
+                                     examined_ids=examined_ids)
+        # gather_candidates returns this group's full set (prior plus new).
+        candidates = [c for c in candidates if c["type"] != type_label] + gathered
+        save_checkpoint(candidates, examined_ids)
+
+    print("\nCandidate pool: {0} total ({1}).".format(
+        len(candidates),
+        ", ".join("{0}={1}".format(t, sum(1 for c in candidates if c["type"] == t))
+                  for t in GROUP_TYPES)))
 
     disorder_ok = assign_disorder(candidates)
     if disorder_ok:
