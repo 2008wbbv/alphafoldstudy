@@ -90,6 +90,27 @@ STEP 4. Run something.
   This downloads structures into ./data and writes results into ./results.
   It is safe to interrupt and re-run: downloads are cached and reused.
 
+  Nothing needs to be built first. Two protein lists ship with the repo:
+
+    proteins_250.csv    250 proteins, 125 viral and 125 cellular
+    proteins_1000.csv   1000 proteins, 445 viral and 555 cellular
+
+  proteins.csv is a copy of the 250 list and is what runs by default. To use
+  the larger one instead:
+
+    python src/af_study.py --registry proteins_1000.csv
+
+  Both lists were pulled from RCSB with one structure per UniProt accession,
+  50 to 600 residues, 3.0 A resolution or better, a confirmed AlphaFold model,
+  and polyprotein fragments excluded. Regenerate them with:
+
+    python src/make_protein_lists.py --sizes 250 1000
+
+  A word on the sizes. The 250 list is evenly balanced. The 1000 list takes
+  every viral protein that qualifies, and 445 is the ceiling: that is how many
+  distinct viral proteins the PDB holds once polyproteins and accessions with
+  no AlphaFold model are removed. The imbalance is a property of the data.
+
 
 -------------------------------------------------------------------------------
  RUNNING ON A CLUSTER
